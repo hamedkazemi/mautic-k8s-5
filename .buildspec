@@ -1,0 +1,86 @@
+version: 0.2
+
+env:
+  secrets-manager:
+    # Secrets from AWS Secrets Manager for production
+    PROD_DB_PASSWORD: prod/db-password
+    RDS_PASSWORD: rds/password
+    RDS_ROOT_PASSWORD: rds/root-password
+    PROD_MAILER_SECRET_KEY: prod/mailer-secret-key
+    PROD_APP_SECRET_KEY: prod/app-secret-key
+    PROD_SAML_IDP_IDENTITY_ID: prod/saml-idp-identity-id
+
+  variables:
+    # GitLab CI Variables
+    NAMESPACE: $CI_COMMIT_BRANCH
+    RELEASE_NAME: mautic-$CI_COMMIT_BRANCH
+    # ECR Repository URLs
+    MAUTIC_REPOSITORY_URL: $MAUTIC_REPOSITORY_URL
+    NGINX_REPOSITORY_URL: $NGINX_REPOSITORY_URL
+    # Registry and Region
+    ECR_REGISTRY: 554587422376.dkr.ecr.us-west-2.amazonaws.com
+    REGISTRY_AWS_REGION: us-west-2
+    # Deployment Settings
+    PROD_INGRESS_DOMAIN: $PROD_INGRESS_DOMAIN
+    PROD_MAILER_HOST: $PROD_MAILER_HOST
+    PROD_MAILER_USER: $PROD_MAILER_USER
+    MAUTIC_CORS_DOMAINS: $MAUTIC_CORS_DOMAINS
+    PROD_GA_TRACKING_ID: $PROD_GA_TRACKING_ID
+    PROD_MAILER_REGION: $PROD_MAILER_REGION
+    TRUSTED_PROXIES: $TRUSTED_PROXIES
+    RDS_HOST: $RDS_HOST
+
+    # CodeBuild Parameters
+    DEPLOY: "false"
+    PULL_DB: "false"
+    NO_CACHE: "false"
+
+phases:
+  install:
+    runtime-versions:
+      docker: 18
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $REGISTRY_AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+      - echo Retrieving secrets from AWS Secrets Manager...
+      - export RDS_PASSWORD=$(aws secretsmanager get-secret-value --secret-id rds/password --query SecretString --output text | jq -r .RDS_PASSWORD)
+      - export RDS_ROOT_PASSWORD=$(aws secretsmanager get-secret-value --secret-id rds/root-password --query SecretString --output text | jq -r .RDS_ROOT_PASSWORD)
+      - export PROD_MAILER_SECRET_KEY=$(aws secretsmanager get-secret-value --secret-id prod/mailer-secret-key --query SecretString --output text | jq -r .PROD_MAILER_SECRET_KEY)
+      - export PROD_APP_SECRET_KEY=$(aws secretsmanager get-secret-value --secret-id prod/app-secret-key --query SecretString --output text | jq -r .PROD_APP_SECRET_KEY)
+      - export PROD_SAML_IDP_IDENTITY_ID=$(aws secretsmanager get-secret-value --secret-id prod/saml-idp-identity-id --query SecretString --output text | jq -r .PROD_SAML_IDP_IDENTITY_ID)
+  pre_build:
+    commands:
+      - echo Building the Docker image...
+      - docker build -t mautic . $([ "$NO_CACHE" = "true" ] && echo "--no-cache")
+      - echo Tagging the Docker image...
+      - docker tag mautic:latest $ECR_REGISTRY/remotereps-ecr:latest
+  build:
+    commands:
+      - echo Pushing the Docker image to ECR...
+      - docker push $ECR_REGISTRY/remotereps-ecr:latest
+  post_build:
+    commands:
+      - |
+        if [ "$DEPLOY" = "true" ]; then
+          echo Deploying to EKS...
+          aws eks update-kubeconfig --name my-cluster --region $REGISTRY_AWS_REGION
+          kubectl apply -f k8s/deployment.yaml
+        fi
+
+artifacts:
+  files:
+    - '**/*'
+
+parameters:
+  DEPLOY:
+    description: "Set to 'true' to deploy to EKS after build"
+    default: "false"
+    type: String
+  PULL_DB:
+    description: "Set to 'true' to pull the database"
+    default: "false"
+    type: String
+  NO_CACHE:
+    description: "Set to 'true' to build Docker image with --no-cache"
+    default: "false"
+    type: String

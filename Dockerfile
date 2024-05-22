@@ -1,48 +1,130 @@
-FROM bitnami/php-fpm:7.3-prod AS mautic
+ARG type
 
-RUN apt-get update && apt-get install redis-tools unzip git build-essential libtool autoconf unzip wget -y
+FROM php:8.1-fpm as builder
 
-RUN pecl install redis
+LABEL vendor="Mautic"
+LABEL maintainer="Mautic core team <>"
 
-COPY infra/php7-fpm/php.ini /opt/bitnami/php/etc/php.ini
+# Install PHP extensions
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    ca-certificates \
+    build-essential  \
+    git \
+    curl \
+    libcurl4-gnutls-dev \
+    libc-client-dev \
+    libkrb5-dev \
+    libmcrypt-dev \
+    libssl-dev \
+    libxml2-dev \
+    libzip-dev \
+    libjpeg-dev \
+    libmagickwand-dev \
+    libpng-dev \
+    libgif-dev \
+    libtiff-dev \
+    libz-dev \
+    libpq-dev \
+    imagemagick \
+    graphicsmagick \
+    libwebp-dev \
+    libjpeg62-turbo-dev \
+    libxpm-dev \
+    libaprutil1-dev \
+    libicu-dev \
+    libfreetype6-dev \
+    libonig-dev \
+    librabbitmq-dev \
+    unzip \
+    nodejs \
+    autoconf \
+    npm
 
-RUN composer global require hirak/prestissimo
+RUN curl -L -o /tmp/amqp.tar.gz "https://github.com/php-amqp/php-amqp/archive/refs/tags/v2.1.1.tar.gz" \
+    && mkdir -p /usr/src/php/ext/amqp \
+    && tar -C /usr/src/php/ext/amqp -zxvf /tmp/amqp.tar.gz --strip 1 \
+    && rm /tmp/amqp.tar.gz
 
-COPY . /var/www/symfony
+RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-configure imap --with-kerberos --with-imap-ssl \
+    && docker-php-ext-configure opcache --enable-opcache \
+    && docker-php-ext-install intl mbstring mysqli curl pdo_mysql zip bcmath sockets exif amqp gd imap opcache \
+    && docker-php-ext-enable intl mbstring mysqli curl pdo_mysql zip bcmath sockets exif amqp gd imap opcache
+# Install Redis Extension
+RUN pecl install -o -f redis \
+    &&  rm -rf /tmp/pear \
+    &&  docker-php-ext-enable redis
 
-RUN useradd -u 1001 -r -g 0 -d /app -s /bin/bash -c "Default Application User" default
+    
+# Install composer
+RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/bin --filename=composer
 
-RUN mkdir /cache && chown -R 1001:0 /cache && chmod -R g+rwX /cache
-RUN mkdir /logs && chown -R 1001:0 /logs && chmod -R g+rwX /logs
-RUN mkdir /mnt/media && chown -R 1001:0 /mnt/media && chmod -R g+rwX /mnt/media
-RUN mkdir /mnt/spool && chown -R 1001:0 /mnt/spool && chmod -R g+rwX /mnt/spool
+RUN echo "memory_limit = -1" > /usr/local/etc/php/php.ini
 
-WORKDIR /var/www/symfony
+# Define Mautic version by package tag
+ARG MAUTIC_VERSION=5.x
 
-RUN composer install --no-dev --prefer-dist --no-interaction --no-ansi --optimize-autoloader --verbose
-
-RUN ln -s /mnt/media /var/www/symfony/mautic/media
-
-RUN chown -R 1001:0 /var/www/symfony && chmod -R g+rwX /var/www/symfony
-
-USER 1001
-
-
-FROM nginx:1.17 AS nginx
-
-RUN useradd -u 1001 -r -g 0 -d /app -s /sbin/nologin -c "Default Application User" default \
-    && mkdir -p /app \
-    && chown -R 1001:0 /app && chmod -R g+rwX /app
-
-COPY infra/nginx/nginx.conf /etc/nginx
-COPY infra/nginx/symfony.conf /etc/nginx/conf.d/default.conf
-
-COPY --from=mautic /var/www/symfony /var/www/symfony
+RUN cd /opt && \
+    COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_PROCESS_TIMEOUT=10000 composer create-project mautic/recommended-project:${MAUTIC_VERSION} mautic --no-interaction && \
+    rm -rf /opt/mautic/var/cache/js && \
+    find /opt/mautic/node_modules -mindepth 1 -maxdepth 1 -not \( -name 'jquery' -or -name 'vimeo-froogaloop2' \) | xargs rm -rf
 
 
-RUN chown -R 1001:0 /var/log && chmod -R g+rwX /var/log
-RUN chown -R 1001:0 /var/cache/nginx && chmod -R g+rwX /var/cache/nginx
-RUN chown -R 1001:0 /var/run && chmod -R g+rwX /var/run
-RUN chown -R 1001:0 /etc/nginx && chmod -R g+rwX /etc/nginx
 
-EXPOSE 8080
+FROM bitnami/php-fpm:8.1-prod AS mautic
+
+COPY --from=builder /usr/local/lib/php/extensions /usr/local/lib/php/extensions
+COPY --from=builder /usr/local/etc/php/conf.d/ /usr/local/etc/php/conf.d/
+
+COPY --from=builder --chown=www-data:www-data /opt/mautic /var/www/html
+
+# Install PHP extensions requirements and other dependencies
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    unzip libwebp-dev libzip-dev libfreetype6-dev libjpeg62-turbo-dev libpng-dev libc-client-dev librabbitmq4 \
+    mariadb-client supervisor cron libfcgi-bin \
+    && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm /etc/cron.daily/*
+    
+
+# Setting PHP properties
+ENV PHP_INI_VALUE_DATE_TIMEZONE='America/Los_Angeles' \
+    PHP_INI_VALUE_MEMORY_LIMIT=512M \
+    PHP_INI_VALUE_UPLOAD_MAX_FILESIZE=512M \
+    PHP_INI_VALUE_POST_MAX_FILESIZE=512M \
+    PHP_INI_VALUE_MAX_EXECUTION_TIME=300
+
+COPY ./infra/common/php.ini /usr/local/etc/php/php.ini
+
+COPY ./infra/common/opcache.ini /usr/local/etc/php/conf.d/opcache.ini
+
+
+COPY ./infra/common/docker-entrypoint.sh /entrypoint.sh
+COPY ./infra/common/entrypoint_mautic_web.sh /entrypoint_mautic_web.sh
+COPY ./infra/common/entrypoint_mautic_cron.sh /entrypoint_mautic_cron.sh
+COPY ./infra/common/entrypoint_mautic_worker.sh /entrypoint_mautic_worker.sh
+
+# Apply necessary permissions
+RUN ["chmod", "+x", "/entrypoint.sh", "/entrypoint_mautic_web.sh", "/entrypoint_mautic_cron.sh", "/entrypoint_mautic_worker.sh"]
+
+# Setting worker env vars
+ENV DOCKER_MAUTIC_WORKERS_CONSUME_EMAIL=2 \
+    DOCKER_MAUTIC_WORKERS_CONSUME_HIT=2 \
+    DOCKER_MAUTIC_WORKERS_CONSUME_FAILED=2
+
+COPY ./infra/common/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+# Define Mautic volumes to persist data
+VOLUME /var/www/html/config
+VOLUME /var/www/html/var/logs
+VOLUME /var/www/html/docroot/media
+
+WORKDIR /var/www/html/docroot
+
+ENV DOCKER_MAUTIC_ROLE=mautic_web \
+    DOCKER_MAUTIC_RUN_MIGRATIONS=false \
+    DOCKER_MAUTIC_LOAD_TEST_DATA=false
+
+ENTRYPOINT ["/entrypoint.sh"]
+
+CMD ["php-fpm"]
